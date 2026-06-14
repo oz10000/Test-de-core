@@ -57,14 +57,32 @@ RANDOM_SEED = 42
 np.random.seed(RANDOM_SEED)
 random.seed(RANDOM_SEED)
 
+# Default keys (will be overridden if signal_engine is available)
 SCORE_KEY = "score"
 SIGNAL_KEY = "signal"
 MACRO_KEY = "macro"
 
+# Flag to indicate if signal_engine is available
+SIGNAL_ENGINE_AVAILABLE = False
+compute_signal = None
+
+# Try to import signal_engine
+try:
+    from signal_engine import compute_signal as _compute_signal
+    compute_signal = _compute_signal
+    SIGNAL_ENGINE_AVAILABLE = True
+    logger.info("signal_engine module loaded successfully.")
+except ImportError as e:
+    logger.error(f"signal_engine not found: {e}. All tests will be skipped.")
+except Exception as e:
+    logger.error(f"Error loading signal_engine: {e}. All tests will be skipped.")
+
 # ==================== HELPER: INTROSPECT SIGNAL ENGINE ====================
 def introspect_signal_engine():
+    global SCORE_KEY, SIGNAL_KEY, MACRO_KEY
+    if not SIGNAL_ENGINE_AVAILABLE or compute_signal is None:
+        return None, set()
     try:
-        from signal_engine import compute_signal
         n = 200
         df = pd.DataFrame({
             "timestamp": pd.date_range("2023-01-01", periods=n, freq="4h"),
@@ -77,10 +95,16 @@ def introspect_signal_engine():
         res = compute_signal(df, df, df)
         keys = set(res.keys())
         logger.info(f"signal_engine keys detected: {keys}")
+        if "score" in keys:
+            SCORE_KEY = "score"
+        if "signal" in keys:
+            SIGNAL_KEY = "signal"
+        if "macro" in keys:
+            MACRO_KEY = "macro"
         return compute_signal, keys
     except Exception as e:
-        logger.error(f"Could not import compute_signal or call it: {e}")
-        sys.exit(1)
+        logger.error(f"Introspection failed: {e}")
+        return None, set()
 
 # ==================== DATA DOWNLOAD (PAGINATED) ====================
 def fetch_klines_paginated(symbol: str, interval: str, target_candles: int) -> Optional[pd.DataFrame]:
@@ -176,7 +200,7 @@ def generate_synthetic_data():
     })
     return df_sol, df_btc, df_eth
 
-# ==================== TEST FUNCTIONS ====================
+# ==================== TEST FUNCTIONS (all skip if signal_engine unavailable) ====================
 def test_integrity(df_sol, df_btc, df_eth):
     logger.info("[INTEGRITY] Starting...")
     issues = []
@@ -472,7 +496,14 @@ def generate_markdown_report(results: Dict) -> str:
     lines.append(f"- Python version: {sys.version}")
     lines.append(f"- Random seed: {RANDOM_SEED}")
     lines.append(f"- Target candles: {TARGET_CANDLES}")
+    lines.append(f"- Signal engine available: {SIGNAL_ENGINE_AVAILABLE}")
     lines.append("")
+    if not SIGNAL_ENGINE_AVAILABLE:
+        lines.append("## ERROR: signal_engine module not found")
+        lines.append("The file `signal_engine.py` is missing or does not export `compute_signal`.")
+        lines.append("All tests were skipped. Please ensure the module is present in the root directory.")
+        lines.append("")
+        return "\n".join(lines)
     lines.append("## Data Source")
     lines.append(f"- Real data used: {results.get('data_source', 'unknown')}")
     lines.append("")
@@ -602,16 +633,23 @@ def main():
     # Generate workflow YAML
     generate_workflow_yaml()
 
-    # Introspect signal engine
-    compute_signal, engine_keys = introspect_signal_engine()
-    global SCORE_KEY, SIGNAL_KEY, MACRO_KEY
-    if "score" in engine_keys:
-        SCORE_KEY = "score"
-    if "signal" in engine_keys:
-        SIGNAL_KEY = "signal"
-    if "macro" in engine_keys:
-        MACRO_KEY = "macro"
-    logger.info(f"Using keys: score='{SCORE_KEY}', signal='{SIGNAL_KEY}', macro='{MACRO_KEY}'")
+    # Introspect signal engine (if available)
+    compute_fn, engine_keys = introspect_signal_engine()
+    if compute_fn is None:
+        logger.error("Cannot proceed without signal_engine. Creating error report.")
+        # Create empty results directory and error report
+        error_report = "# Signal Engine Research Report\n\n"
+        error_report += "## ERROR: signal_engine module not found\n"
+        error_report += "The file `signal_engine.py` is missing or does not export `compute_signal`.\n"
+        error_report += "Please add the module and rerun the research.\n"
+        report_path = os.path.join(OUTPUT_DIR, "signal_research_report.md")
+        with open(report_path, "w") as f:
+            f.write(error_report)
+        # Also create empty CSV files to avoid missing artifact issues
+        for name in ["threshold_sweep.csv", "scenario_results.csv", "score_distribution.csv", "stress_results.csv", "performance_metrics.csv"]:
+            pd.DataFrame().to_csv(os.path.join(OUTPUT_DIR, name), index=False)
+        logger.info("Error report and empty artifacts generated.")
+        return
 
     # Load data
     df_sol, df_btc, df_eth = load_real_data()
@@ -633,7 +671,7 @@ def main():
 
     try:
         t0 = time.time()
-        results["stability"] = test_mathematical_stability(compute_signal, df_sol, df_btc, df_eth, engine_keys)
+        results["stability"] = test_mathematical_stability(compute_fn, df_sol, df_btc, df_eth, engine_keys)
         stability_time = time.time() - t0
     except Exception as e:
         logger.exception("Stability test failed")
@@ -642,7 +680,7 @@ def main():
 
     try:
         t0 = time.time()
-        results["atr_zero"] = test_atr_zero(compute_signal)
+        results["atr_zero"] = test_atr_zero(compute_fn)
         atr_zero_time = time.time() - t0
     except Exception as e:
         logger.exception("ATR zero test failed")
@@ -651,7 +689,7 @@ def main():
 
     try:
         t0 = time.time()
-        results["extreme_corr"] = test_extreme_correlation(compute_signal)
+        results["extreme_corr"] = test_extreme_correlation(compute_fn)
         correlation_time = time.time() - t0
     except Exception as e:
         logger.exception("Extreme correlation test failed")
@@ -660,7 +698,7 @@ def main():
 
     try:
         t0 = time.time()
-        results["monte_carlo"] = monte_carlo_simulation(compute_signal, n_sims=1000, n_candles=500)
+        results["monte_carlo"] = monte_carlo_simulation(compute_fn, n_sims=1000, n_candles=500)
         monte_carlo_time = time.time() - t0
     except Exception as e:
         logger.exception("Monte Carlo failed")
@@ -670,7 +708,7 @@ def main():
     try:
         t0 = time.time()
         thresholds = [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.35, 0.40]
-        sweep_df = threshold_sweep(compute_signal, df_sol, df_btc, df_eth, thresholds, min_idx=100)
+        sweep_df = threshold_sweep(compute_fn, df_sol, df_btc, df_eth, thresholds, min_idx=100)
         sweep_df.to_csv(os.path.join(OUTPUT_DIR, "threshold_sweep.csv"), index=False)
         results["threshold_sweep"] = sweep_df
         threshold_time = time.time() - t0
@@ -681,7 +719,7 @@ def main():
 
     try:
         t0 = time.time()
-        scenario_df = scenario_testing(compute_signal)
+        scenario_df = scenario_testing(compute_fn)
         scenario_df.to_csv(os.path.join(OUTPUT_DIR, "scenario_results.csv"), index=False)
         results["scenario"] = scenario_df
         scenario_time = time.time() - t0
@@ -724,7 +762,7 @@ def main():
 
     try:
         t0 = time.time()
-        results["stress_issues"] = stress_test(compute_signal)
+        results["stress_issues"] = stress_test(compute_fn)
         stress_time = time.time() - t0
         with open(os.path.join(OUTPUT_DIR, "stress_results.csv"), "w") as f:
             f.write("issue\n")
